@@ -1,0 +1,68 @@
+name: Deploy to EKS
+
+on:
+  push:
+    branches:
+      - main  # Aktywacja pipeline na push do gałęzi main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      # Ustawienie tylko zmiennej IMAGE_TAG w GITHUB_ENV (bez sekretów)
+      - name: Set up variables
+        run: echo "IMAGE_TAG=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # Ustawienie AWS CLI i konfiguracja dostępów
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Konfiguracja kubectl do połączenia z EKS
+      - name: Set up kubectl
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+        run: aws eks --region $AWS_REGION update-kubeconfig --name $EKS_CLUSTER_NAME
+
+      # Budowanie i wypchnięcie obrazu Docker do ECR
+      - name: Build and push Docker image to ECR
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REPO_NAME: ${{ secrets.ECR_REPO_NAME }}
+        run: |
+          # Budowanie JAR przy użyciu Gradle
+          ./gradlew clean bootJar -x test
+          
+          # Logowanie do Amazon ECR
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          
+          # Budowanie i tagowanie obrazu
+          docker build -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_NAME:$IMAGE_TAG .
+          docker tag $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_NAME:latest
+          
+          # Wypchnięcie obrazu do ECR
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_NAME:$IMAGE_TAG
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_NAME:latest
+
+      # Zaktualizowanie pliku deployment.yaml z IMAGE_TAG
+      - name: Update deployment.yaml with IMAGE_TAG
+        env:
+          ECR_REPO_NAME: ${{ secrets.ECR_REPO_NAME }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: envsubst < k8s/deployment.yaml > k8s/deployment_updated.yaml
+
+      # Zastosowanie zaktualizowanego pliku YAML do EKS
+      - name: Deploy to EKS
+        run: |
+          kubectl apply -f k8s/deployment_updated.yaml
+          kubectl apply -f k8s/service.yaml
